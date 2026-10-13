@@ -25,8 +25,6 @@ static bool copy_before_wait;
 static float * output_data;
 static size_t output_count;
 static int sync_count;
-static ggml_backend_dispatch_profile_t profile;
-static int reuses, launches, direct;
 
 static void CUDART_CB hold_tail(void *) {
     while (!release_gate.load(std::memory_order_acquire)) {
@@ -35,13 +33,7 @@ static void CUDART_CB hold_tail(void *) {
 }
 
 static ggml_status graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
-    profile(backend, nullptr, true);
     const auto status = original.graph_compute(backend, graph);
-    ggml_backend_dispatch_profile dispatch {};
-    profile(backend, &dispatch, false);
-    reuses += dispatch.reuse;
-    launches += dispatch.launches;
-    direct += dispatch.direct;
     if (armed && status == GGML_STATUS_SUCCESS) {
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
             if (strcmp(ggml_graph_node(graph, i)->name, "result_output") == 0) {
@@ -98,9 +90,6 @@ int main(int argc, char ** argv) {
     }
     assert(gpu);
     original = gpu->iface;
-    profile = (ggml_backend_dispatch_profile_t) ggml_backend_reg_get_proc_address(
-        ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu)), "ggml_backend_dispatch_profile");
-    assert(profile);
     assert(original.graph_compute && original.get_tensor_async && original.event_wait && original.synchronize);
     fence = ggml_backend_event_new(ggml_backend_get_device(gpu));
     assert(fence);
@@ -201,12 +190,6 @@ int main(int argc, char ** argv) {
         assert(llama_get_logits_ith(ctx, -1));
         puts("PASS: real CPU graph abort, explicit completion/reset, fresh prompt and generated-decode recovery");
     }
-    if (getenv("GGML_CUDA_DISABLE_GRAPHS")) {
-        assert(reuses == 0 && launches == 0 && direct > 0);
-    } else {
-        assert(reuses > 0 && launches > 0);
-    }
-    printf("PASS: dispatch reuses=%d launches=%d direct=%d\n", reuses, launches, direct);
     gpu->iface = original;
     ggml_backend_event_free(fence);
     assert(cudaStreamDestroy(gate_stream) == cudaSuccess);

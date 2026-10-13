@@ -28,21 +28,19 @@ int main() {
     ggml_backend_dev_t dev = ggml_backend_get_device(gpu);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     auto fused = (ggml_backend_fused_stage_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fused_stage");
-    auto profile = (ggml_backend_dispatch_profile_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dispatch_profile");
-    assert(fused && profile);
+    assert(fused);
     using fused_timing = ggml_backend_fused_timing;
     using timing_fn = ggml_backend_fused_timing_t;
     auto timing = (timing_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fused_timing");
     const bool test_timing = getenv("WACKMALL_TEST_FUSED_TIMING") != nullptr;
     if (test_timing) {
         assert(timing && "missing opt-in fused suffix timing extension");
-        timing(gpu, 0, nullptr);
-        timing(gpu, 3, nullptr);
+        timing(gpu, GGML_BACKEND_FUSED_TIMING_ARM, nullptr);
+        timing(gpu, GGML_BACKEND_FUSED_TIMING_CANCEL, nullptr);
         fused_timing cancelled {};
-        timing(gpu, 2, &cancelled);
+        timing(gpu, GGML_BACKEND_FUSED_TIMING_DETACH, &cancelled);
         assert(!cancelled.ready && cancelled.hot_us == 0.0);
     }
-    int captures = 0, reuse = 0;
     for (int reset = 0; reset < 3; ++reset) {
         ggml_context * ctx = ggml_init({1024*1024, nullptr, true});
         ggml_context * host_ctx = ggml_init({1024*1024, nullptr, true});
@@ -70,16 +68,11 @@ int main() {
         for (int generation = 0; generation < 16; ++generation) {
             for (int i = 0; i < 32; ++i) values[i] = float((generation % 2 ? 31-i : i) + generation*32);
             ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
-            profile(gpu, nullptr, true);
             const bool timed = test_timing && generation % 4 != 0;
-            if (timed) timing(gpu, 0, nullptr);
+            if (timed) timing(gpu, GGML_BACKEND_FUSED_TIMING_ARM, nullptr);
             int64_t wait = -1;
             assert(fused(gpu, &prefix, &suffix, copies, 2, &wait));
             assert(wait >= 0);
-            ggml_backend_dispatch_profile p {};
-            profile(gpu, &p, false);
-            assert(p.calls == 1);
-            captures += p.captures; reuse += p.reuse;
             const float * staged_x = (const float *) x_copy->data;
             const int32_t * staged_ids = (const int32_t *) ids_copy->data;
             for (int i = 0; i < 32; ++i) {
@@ -107,11 +100,11 @@ int main() {
                 ggml_backend_event_wait(gpu, gate_event);
             }
             fused_timing t {};
-            if (test_timing) timing(gpu, 2, &t);
+            if (test_timing) timing(gpu, GGML_BACKEND_FUSED_TIMING_DETACH, &t);
             if (blocked_join) {
                 void * pending = t.pending;
                 assert(pending);
-                timing(gpu, 1, &t);
+                timing(gpu, GGML_BACKEND_FUSED_TIMING_QUERY, &t);
                 assert(!t.ready && t.pending == pending && !gate.timed_out);
                 gate.release = true;
             }
@@ -125,12 +118,12 @@ int main() {
             }
             if (test_timing) {
                 void * pending = t.pending;
-                timing(gpu, 1, &t);
+                timing(gpu, GGML_BACKEND_FUSED_TIMING_QUERY, &t);
                 if (t.ready != timed || t.pending != pending) {
                     fprintf(stderr, "query mismatch: generation=%d timed=%d ready=%d ownership=%d\n", generation, timed, t.ready, t.pending == pending);
                 }
                 assert(t.ready == timed && t.pending == pending);
-                timing(gpu, 4, &t);
+                timing(gpu, GGML_BACKEND_FUSED_TIMING_COLLECT, &t);
                 assert(t.ready == timed);
                 assert(t.hot_us >= 0.0 && std::isfinite(t.hot_us));
                 assert(t.hot_to_join_us >= 0.0 && std::isfinite(t.hot_to_join_us));
@@ -154,8 +147,6 @@ int main() {
         ggml_free(host_ctx);
         ggml_free(ctx);
     }
-    if (getenv("GGML_CUDA_DISABLE_GRAPHS")) assert(captures == 0 && reuse == 0);
-    else assert(captures >= 3 && reuse >= 3);
     ggml_backend_free(gpu);
-    puts("PASS: F32/I32 readiness, 48 generations, capture/reuse, reallocation and eligibility rejection");
+    puts("PASS: F32/I32 readiness, 48 generations, reallocation and eligibility rejection");
 }

@@ -1424,8 +1424,6 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
-    bool profile_dispatch = false;
-    ggml_backend_dispatch_profile dispatch_profile = {};
     int stage_start = -1;
     cudaEvent_t stage_ready = nullptr;
     cudaEvent_t stage_hot_start = nullptr, stage_hot_end = nullptr;

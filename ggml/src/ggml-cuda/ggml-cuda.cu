@@ -3899,8 +3899,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
-    const int64_t evaluate_start = cuda_ctx->profile_dispatch ? ggml_time_us() : 0;
-    [[maybe_unused]] int64_t capture_api_us = 0;
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4109,16 +4107,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            const int64_t api_start = cuda_ctx->profile_dispatch ? ggml_time_us() : 0;
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
-            if (cuda_ctx->profile_dispatch) {
-                capture_api_us += ggml_time_us() - api_start;
-            }
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4130,12 +4124,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     }
 
-    if (cuda_ctx->profile_dispatch) {
-        cuda_ctx->dispatch_profile.evaluate_us += ggml_time_us() - evaluate_start - capture_api_us;
-        cuda_ctx->dispatch_profile.graph_api_us += capture_api_us;
-    }
     if (use_cuda_graph) {
-        const int64_t api_start = cuda_ctx->profile_dispatch ? ggml_time_us() : 0;
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
@@ -4143,22 +4132,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
-        if (cuda_ctx->profile_dispatch) {
-            cuda_ctx->dispatch_profile.graph_api_us += ggml_time_us() - api_start;
-        }
         // Launch graph
-        const int64_t launch_start = cuda_ctx->profile_dispatch ? ggml_time_us() : 0;
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
-        if (cuda_ctx->profile_dispatch) {
-            cuda_ctx->dispatch_profile.launch_us += ggml_time_us() - launch_start;
-            cuda_ctx->dispatch_profile.launches++;
-        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
-        if (cuda_ctx->profile_dispatch) {
-            cuda_ctx->dispatch_profile.evaluate_us += ggml_time_us() - evaluate_start;
-        }
 #endif  // USE_CUDA_GRAPH
     }
 }
@@ -4182,7 +4160,6 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    const int64_t dispatch_start = cuda_ctx->profile_dispatch ? ggml_time_us() : 0;
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -4227,10 +4204,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
-    if (cuda_ctx->profile_dispatch) {
-        cuda_ctx->dispatch_profile.bookkeeping_us += ggml_time_us() - dispatch_start;
-    }
-    const int64_t capture_start = cuda_ctx->profile_dispatch ? ggml_time_us() : 0;
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4241,24 +4214,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    if (cuda_ctx->profile_dispatch) {
-        cuda_ctx->dispatch_profile.graph_api_us += ggml_time_us() - capture_start;
-    }
-
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
-
-    if (cuda_ctx->profile_dispatch) {
-        auto & p = cuda_ctx->dispatch_profile;
-        p.dispatch_us += ggml_time_us() - dispatch_start;
-        p.calls++;
-        if (!use_cuda_graph) {
-            p.direct++;
-        } else if (cuda_graph_update_required) {
-            p.captures++;
-        } else {
-            p.reuse++;
-        }
-    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -4330,12 +4286,12 @@ static bool ggml_backend_cuda_fused_stage(ggml_backend_t backend, ggml_cgraph * 
 static void ggml_backend_cuda_fused_timing(ggml_backend_t backend, int action, ggml_backend_fused_timing * out) {
     auto * ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(ctx->device);
-    if (action == 0) {
+    if (action == GGML_BACKEND_FUSED_TIMING_ARM) {
         GGML_ASSERT(!ctx->timed_fused);
         ctx->time_next_fused = true;
         return;
     }
-    if (action == 2 && out) {
+    if (action == GGML_BACKEND_FUSED_TIMING_DETACH && out) {
         *out = {};
         if (ctx->timed_fused) {
             CUDA_CHECK(cudaEventRecord(ctx->timed_fused->join, ctx->stream()));
@@ -4345,11 +4301,11 @@ static void ggml_backend_cuda_fused_timing(ggml_backend_t backend, int action, g
         ctx->time_next_fused = false;
         return;
     }
-    auto * pending = (action == 1 || action == 4) && out ? (std::shared_ptr<ggml_cuda_hot_timing> *) out->pending : nullptr;
-    const auto events = pending ? *pending : (action == 4 ? nullptr : ctx->timed_fused);
+    auto * pending = (action == GGML_BACKEND_FUSED_TIMING_QUERY || action == GGML_BACKEND_FUSED_TIMING_COLLECT) && out ? (std::shared_ptr<ggml_cuda_hot_timing> *) out->pending : nullptr;
+    const auto events = pending ? *pending : (action == GGML_BACKEND_FUSED_TIMING_COLLECT ? nullptr : ctx->timed_fused);
     if (out) {
         *out = {};
-        if (action == 1) out->pending = pending;
+        if (action == GGML_BACKEND_FUSED_TIMING_QUERY) out->pending = pending;
         if (events) {
             const cudaError_t status = cudaEventQuery(pending ? events->join : events->end);
             if (status == cudaSuccess) {
@@ -4366,8 +4322,8 @@ static void ggml_backend_cuda_fused_timing(ggml_backend_t backend, int action, g
             }
         }
     }
-    if (action == 4) delete pending;
-    if (action == 2 || action == 3) {
+    if (action == GGML_BACKEND_FUSED_TIMING_COLLECT) delete pending;
+    if (action == GGML_BACKEND_FUSED_TIMING_DETACH || action == GGML_BACKEND_FUSED_TIMING_CANCEL) {
         ctx->timed_fused.reset();
         ctx->time_next_fused = false;
     }
@@ -5541,21 +5497,6 @@ static bool ggml_backend_cuda_flash_attn_causal_prefix_supported(ggml_backend_de
 #endif
 }
 
-static void ggml_backend_cuda_dispatch_profile(ggml_backend_t backend, ggml_backend_dispatch_profile * out, bool reset) {
-    auto * ctx = (ggml_backend_cuda_context *) backend->context;
-    if (reset) {
-        ctx->profile_dispatch = true;
-        ctx->dispatch_profile = {};
-    }
-    if (out) {
-        *out = ctx->dispatch_profile;
-#ifdef USE_CUDA_GRAPH
-        out->graphs_cached = ctx->cuda_graphs.size();
-#endif
-        ctx->profile_dispatch = false;
-    }
-}
-
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_set_timing") == 0) {
@@ -5572,9 +5513,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) ggml_backend_cuda_fused_timing;
     }
 #endif
-    if (strcmp(name, "ggml_backend_dispatch_profile") == 0) {
-        return (void *)ggml_backend_cuda_dispatch_profile;
-    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

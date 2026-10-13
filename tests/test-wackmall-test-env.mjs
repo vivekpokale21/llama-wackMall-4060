@@ -5,6 +5,8 @@ const inherited = {
     PATH: '/usr/bin', LD_LIBRARY_PATH: '/cuda/lib',
     LLAMA_EXPERT_SIDECAR_OUT: '/user/private-data', LLAMA_EXPERT_ASYNC_COLD_UPLOAD: '1',
     GGML_SCHED_PROFILE: '1', GGML_CUDA_NO_PINNED: '1', WACKMALL_TEST_PERIODIC: '1',
+    GGML_CUDA_GRAPH_OPT: '0', GGML_CUDA_DISABLE_GRAPHS: '1', WACKMALL_TEST_CALLBACK: '1',
+    WACKMALL_TEST_COLD_UPLOAD_GUARD: 'reuse', WACKMALL_TEST_COLD_UPLOAD_ABORT: '1',
 };
 assert.deepEqual(fixtureEnv(inherited), { PATH: '/usr/bin', LD_LIBRARY_PATH: '/cuda/lib' });
 const explicit = stagingEnv({ ...fixtureEnv(inherited), LLAMA_EXPERT_OBSERVE: '/tmp/test-output',

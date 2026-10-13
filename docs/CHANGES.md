@@ -44,9 +44,9 @@ Completion, source-lifetime and weight/LUT publication barriers are retained. Co
 
 - New caller-certified `llama_decode_generated()` and scheduler attribution, integrated into supported single-slot non-speculative server generation.
 - Internal backend/tensor metadata for compact masks, protected execution and diagnostics. Rebuild embedders/bindings/backends; ABI compatibility with stock or earlier builds is not promised.
-- Opt-in wait/copy/enqueue/dependency/dispatch/hot/cold/join profiling, CPU cold timings, completed-count observations and promotion logs. Timing intervals can overlap; diagnostic totals are not an exclusive latency decomposition.
+- Opt-in wait/copy/enqueue/hot/cold/join profiling, CPU cold timings, completed-count observations and promotion logs. Timing intervals can overlap; diagnostic totals are not an exclusive latency decomposition. One-shot dependency/address dumps and CUDA dispatch bookkeeping are retained only in the `debug` checkpoint.
 - Focused policy/provenance, compact-mask, mixed-placement persistence, staging/fusion, output-publication and pending-upload/abort/recovery tests; guarded CUDA MMQ numerical regression.
-- Release assertions retained in focused tests, output-environment isolation and CMake/CTest registration. Model-dependent output-sync remains build-only; the prefix-event probe remains exploratory. Focused CUDA runtime checks passed; full automatic CTest and clean-checkout release validation remain open.
+- Release assertions retained in focused tests, output-environment isolation and CMake/CTest registration. Model-dependent output-sync remains build-only; the standalone exploratory prefix-event probe is retained only in `debug`. Focused CUDA runtime checks passed; full automatic CTest and clean-checkout release validation remain open.
 
 ## Attribution and maintenance
 

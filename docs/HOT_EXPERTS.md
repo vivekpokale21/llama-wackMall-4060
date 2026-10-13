@@ -102,7 +102,7 @@ Sidecars are model-fingerprinted and use physical model-layer indexing, includin
 
 Inherited RAM/disk/prefetch controls remain available: `RAMPOOL=0` GiB, `PREAD=1`, `MADVISE=1`, `PREDICT=0`, `PREFETCH_GB=0`, `PREFETCH_MB=64` MiB and `PREFETCH_THREADS=2` (clamped 1..8), all under `LLAMA_EXPERT_`. `PREDICT_LOG` writes prediction and route traces. These mechanisms are not systematically benchmarked in the current profile. Periodic mode requires RAMPOOL/PREAD/MADVISE/PREDICT/PREFETCH_GB off; conflicting settings disable tier initialization with a diagnostic. The reproduction profile also zeros PREFETCH_MB.
 
-`GGML_SCHED_PROFILE`, `GGML_SCHED_PROFILE_DEPS`, `GGML_SCHED_EXPERT_TIMING` and `GGML_SCHED_EXPERT_INPUT_TIMING` enable different diagnostic views. Keep profiling and output logs off for throughput comparisons. Runtime `--cache-ram` is a prompt-cache budget, unrelated to hot-expert slots. The execution switches default off.
+`GGML_SCHED_PROFILE`, `GGML_SCHED_EXPERT_TIMING` and `GGML_SCHED_EXPERT_INPUT_TIMING` enable different diagnostic views. Keep profiling and output logs off for throughput comparisons. Runtime `--cache-ram` is a prompt-cache budget, unrelated to hot-expert slots. The execution switches default off. The retired dependency/address dump and CUDA dispatch profiler remain in the `debug` checkpoint.
 
 ## Source map and boundaries
 

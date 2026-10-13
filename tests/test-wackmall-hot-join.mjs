@@ -7,9 +7,6 @@ assert(binary && seed, 'usage: node test-wackmall-hot-join.mjs STAGING_BINARY SE
 function fixture(enabled, generated, direct = false, disabled = false, fallback = '') {
     const env = {...fixtureEnv(), LLAMA_EXPERT_FUSE_STAGING: '1', GGML_SCHED_PROFILE: '0',
         GGML_SCHED_EXPERT_TIMING: enabled ? '1' : '0', WACKMALL_TEST_TIMING_GENERATED: generated ? '1' : '0'};
-    delete env.GGML_CUDA_DISABLE_GRAPHS;
-    delete env.GGML_CUDA_NO_PINNED;
-    delete env.WACKMALL_TEST_CALLBACK;
     if (direct) env.GGML_CUDA_DISABLE_GRAPHS = '1';
     if (fallback === 'pageable') env.GGML_CUDA_NO_PINNED = '1';
     if (fallback === 'callback') env.WACKMALL_TEST_CALLBACK = '1';

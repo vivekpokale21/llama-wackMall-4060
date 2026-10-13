@@ -8,7 +8,6 @@ function fixture(inputs, generated, timing = true, direct = false, fallback = ''
     const env = {...fixtureEnv(), LLAMA_EXPERT_FUSE_STAGING: '1', GGML_SCHED_PROFILE: '0',
         GGML_SCHED_EXPERT_TIMING: timing ? '1' : '0', GGML_SCHED_EXPERT_INPUT_TIMING: inputs ? '1' : '0',
         WACKMALL_TEST_TIMING_GENERATED: generated ? '1' : '0', WACKMALL_TEST_JOIN_INPUT: '1'};
-    for (const key of ['GGML_CUDA_DISABLE_GRAPHS', 'GGML_CUDA_NO_PINNED', 'WACKMALL_TEST_CALLBACK']) delete env[key];
     if (direct) env.GGML_CUDA_DISABLE_GRAPHS = '1';
     if (fallback === 'pageable') env.GGML_CUDA_NO_PINNED = '1';
     if (fallback === 'callback') env.WACKMALL_TEST_CALLBACK = '1';

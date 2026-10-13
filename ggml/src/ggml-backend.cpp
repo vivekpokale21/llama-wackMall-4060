@@ -830,7 +830,6 @@ struct ggml_backend_sched {
 
     int debug;
     bool profile;
-    bool profile_dependencies;
     uint64_t profile_graphs;
     bool expert_timing;
     bool expert_input_timing;
@@ -850,7 +849,7 @@ struct ggml_backend_sched {
 static void ggml_backend_sched_collect_expert_samples(ggml_backend_sched_t sched) {
     if (!sched->expert_samples) return;
     for (auto & p : *sched->expert_samples) {
-        p.collect(sched->backends[0], 4, &p.hot);
+        p.collect(sched->backends[0], GGML_BACKEND_FUSED_TIMING_COLLECT, &p.hot);
         fprintf(stderr, "expert_path_timing: {\"sched\":\"%p\",\"graph\":%llu,\"generated_decode\":true,\"layer\":%d,\"ready\":%s,\"hot_suffix_us\":%.3f,\"hot_to_join_us\":%.3f,\"cold_compute_us\":%lld,\"gpu_done_at_cpu\":%s,\"join_input_us\":%lld,\"join_wait_us\":%lld,\"join_copy_us\":%lld}\n",
                 (void *) sched, (unsigned long long) p.graph, p.layer, p.hot.ready ? "true" : "false", p.hot.hot_us,
                 p.hot.hot_to_join_us, (long long) p.cold_us, p.gpu_done_at_cpu ? "true" : "false", (long long) p.join_input_us,
@@ -1579,6 +1578,44 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+struct ggml_backend_join_input_timing {
+    int layer, split, input;
+    ggml_tensor * source;
+    ggml_backend_t source_backend;
+    const char * route;
+    int64_t copy_us, wait_us;
+    ggml_backend_set_timing setter;
+};
+
+static void ggml_backend_sched_print_join_input(ggml_backend_sched_t sched, uint64_t expert_graph,
+        const ggml_backend_join_input_timing & row) {
+    const ggml_tensor * root = row.source;
+    while (root->view_src) root = root->view_src;
+    auto quote = [](const char * value) {
+        std::string result = "\"";
+        for (const unsigned char * p = (const unsigned char *) value; *p; ++p) {
+            if (*p == '\"' || *p == '\\') result += '\\';
+            if (*p < 32) {
+                char escaped[7];
+                snprintf(escaped, sizeof(escaped), "\\u%04x", *p);
+                result += escaped;
+            } else result += (char) *p;
+        }
+        return result + "\"";
+    };
+    auto * buffer = row.source->view_src ? row.source->view_src->buffer : row.source->buffer;
+    fprintf(stderr, "expert_join_input: {\"sched\":\"%p\",\"graph\":%llu,\"generated_decode\":true,\"layer\":%d,\"split\":%d,\"input\":%d,\"source_name\":%s,\"root_name\":%s,\"root_op\":%s,\"type\":%s,\"shape\":[%lld,%lld,%lld,%lld],\"bytes\":%zu,\"source_backend\":%s,\"destination_backend\":%s,\"source_buffer\":%s,\"source_host\":%s,\"user_input\":%s,\"route\":%s,\"copy_us\":%lld,\"wait_us\":%lld,\"enqueue_us\":%lld,\"internal_wait_us\":%lld,\"setter_calls\":%d}\n",
+            (void *) sched, (unsigned long long) expert_graph, row.layer, row.split, row.input,
+            quote(row.source->name).c_str(), quote(root->name).c_str(), quote(ggml_op_name(root->op)).c_str(),
+            quote(ggml_type_name(row.source->type)).c_str(), (long long) row.source->ne[0], (long long) row.source->ne[1],
+            (long long) row.source->ne[2], (long long) row.source->ne[3], ggml_nbytes(row.source),
+            quote(ggml_backend_name(row.source_backend)).c_str(), quote(ggml_backend_name(sched->backends[0])).c_str(),
+            quote(ggml_backend_buffer_name(buffer)).c_str(), ggml_backend_buffer_is_host(buffer) ? "true" : "false",
+            row.source->flags & GGML_TENSOR_FLAG_INPUT ? "true" : "false", quote(row.route).c_str(),
+            (long long) row.copy_us, (long long) row.wait_us, (long long) row.setter.enqueue_us,
+            (long long) row.setter.wait_us, row.setter.calls);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     ggml_backend_sched_collect_expert_samples(sched);
@@ -1592,18 +1629,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     } timing[GGML_SCHED_MAX_BACKENDS] = {};
     int64_t n_tokens = -1;
     int cold_ops = 0;
-    ggml_backend_dispatch_profile_t dispatch_profile[GGML_SCHED_MAX_BACKENDS] = {};
     if (sched->profile) {
-        for (int b = 0; b < sched->n_backends; ++b) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
-            if (dev) {
-                dispatch_profile[b] = (ggml_backend_dispatch_profile_t) ggml_backend_reg_get_proc_address(
-                    ggml_backend_dev_backend_reg(dev), "ggml_backend_dispatch_profile");
-                if (dispatch_profile[b]) {
-                    dispatch_profile[b](sched->backends[b], nullptr, true);
-                }
-            }
-        }
         for (int i = 0; i < sched->graph.n_leafs; i++) {
             if (strcmp(sched->graph.leafs[i]->name, "inp_tokens") == 0) {
                 n_tokens = sched->graph.leafs[i]->ne[0];
@@ -1616,21 +1642,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     ggml_tensor * prev_ids_tensor = nullptr;
-    const bool trace_dependencies = sched->profile_dependencies && n_tokens == 1;
-    struct dependency_timing {
-        int split, input;
-        int64_t source_wait_us, destination_wait_us, copy_us;
-    };
-    std::vector<dependency_timing> dependencies;
-    struct join_input_timing {
-        int layer, split, input;
-        ggml_tensor * source;
-        ggml_backend_t source_backend;
-        const char * route;
-        int64_t copy_us, wait_us;
-        ggml_backend_set_timing setter;
-    };
-    std::vector<join_input_timing> join_inputs;
+    std::vector<ggml_backend_join_input_timing> join_inputs;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
     ggml_backend_fused_stage_t fused_stage = nullptr;
@@ -1700,9 +1712,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
-            const int64_t source_before = trace_dependencies || trace_join ? ts.source_wait_us : 0;
-            const int64_t destination_before = trace_dependencies || trace_join ? ts.destination_wait_us : 0;
-            const int64_t copy_before = trace_dependencies || trace_join ? ts.copy_us : 0;
+            const int64_t source_before = trace_join ? ts.source_wait_us : 0;
+            const int64_t destination_before = trace_join ? ts.destination_wait_us : 0;
+            const int64_t copy_before = trace_join ? ts.copy_us : 0;
             ggml_backend_set_timing setter = {};
             const char * route = "user";
             auto copy_sync = [&] {
@@ -1870,10 +1882,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
-            if (trace_dependencies && split_backend_id == sched->n_backends - 1) {
-                dependencies.push_back({split_id, input_id, ts.source_wait_us - source_before,
-                    ts.destination_wait_us - destination_before, ts.copy_us - copy_before});
-            }
             if (trace_join) {
                 join_inputs.push_back({timed_layer, split_id, input_id, input, input_backend, route,
                     ts.copy_us - copy_before, ts.source_wait_us + ts.destination_wait_us - source_before - destination_before, setter});
@@ -1883,7 +1891,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const int64_t t_compute_us = measure ? ggml_time_us() : 0;
         if (fused_timing && timed_cold_split >= 0 && split_id > timed_cold_split && split_backend_id == 0) {
             ggml_backend_fused_timing p = {};
-            fused_timing(split_backend, 2, &p);
+            fused_timing(split_backend, GGML_BACKEND_FUSED_TIMING_DETACH, &p);
             sched->expert_samples->push_back({expert_graph, timed_layer, p, fused_timing, cold_compute_us, t_compute_us - t_input_us,
                     ts.source_wait_us + ts.destination_wait_us - join_wait_before, ts.copy_us - join_copy_before,
                     gpu_done_at_cpu});
@@ -1934,7 +1942,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     if (valid && count == 2 && hot_count == 3 && cold_uses_copies) {
                         if (fused_timing) {
-                            fused_timing(split_backend, 0, nullptr);
+                            fused_timing(split_backend, GGML_BACKEND_FUSED_TIMING_ARM, nullptr);
                         }
                         fused = fused_stage(split_backend, &split->graph, &hot.graph, copies, 2,
                                             sched->profile ? &ready_wait_us : nullptr);
@@ -1950,7 +1958,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     }
                                 }
                             } else {
-                                fused_timing(split_backend, 3, nullptr);
+                                fused_timing(split_backend, GGML_BACKEND_FUSED_TIMING_CANCEL, nullptr);
                             }
                         }
                         if (fused && sched->profile) {
@@ -1961,7 +1969,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             enum ggml_status ec = fused ? GGML_STATUS_SUCCESS : ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
-                if (fused_timing) fused_timing(sched->backends[0], 3, nullptr);
+                if (fused_timing) fused_timing(sched->backends[0], GGML_BACKEND_FUSED_TIMING_CANCEL, nullptr);
                 return ec;
             }
             if (fused) {
@@ -2013,7 +2021,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (fused_timing && split_id == timed_cold_split) {
             cold_compute_us = ggml_time_us() - t_compute_us;
             ggml_backend_fused_timing p = {};
-            fused_timing(sched->backends[0], 1, &p);
+            fused_timing(sched->backends[0], GGML_BACKEND_FUSED_TIMING_QUERY, &p);
             gpu_done_at_cpu = p.ready;
         }
         if (sched->profile) {
@@ -2029,34 +2037,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     for (const auto & row : join_inputs) {
-        const ggml_tensor * root = row.source;
-        while (root->view_src) root = root->view_src;
-        auto quote = [](const char * value) {
-            std::string result = "\"";
-            for (const unsigned char * p = (const unsigned char *) value; *p; ++p) {
-                if (*p == '\"' || *p == '\\') result += '\\';
-                if (*p < 32) {
-                    char escaped[7];
-                    snprintf(escaped, sizeof(escaped), "\\u%04x", *p);
-                    result += escaped;
-                } else result += (char) *p;
-            }
-            return result + "\"";
-        };
-        auto * buffer = row.source->view_src ? row.source->view_src->buffer : row.source->buffer;
-        fprintf(stderr, "expert_join_input: {\"sched\":\"%p\",\"graph\":%llu,\"generated_decode\":true,\"layer\":%d,\"split\":%d,\"input\":%d,\"source_name\":%s,\"root_name\":%s,\"root_op\":%s,\"type\":%s,\"shape\":[%lld,%lld,%lld,%lld],\"bytes\":%zu,\"source_backend\":%s,\"destination_backend\":%s,\"source_buffer\":%s,\"source_host\":%s,\"user_input\":%s,\"route\":%s,\"copy_us\":%lld,\"wait_us\":%lld,\"enqueue_us\":%lld,\"internal_wait_us\":%lld,\"setter_calls\":%d}\n",
-                (void *) sched, (unsigned long long) expert_graph, row.layer, row.split, row.input,
-                quote(row.source->name).c_str(), quote(root->name).c_str(), quote(ggml_op_name(root->op)).c_str(),
-                quote(ggml_type_name(row.source->type)).c_str(), (long long) row.source->ne[0], (long long) row.source->ne[1],
-                (long long) row.source->ne[2], (long long) row.source->ne[3], ggml_nbytes(row.source),
-                quote(ggml_backend_name(row.source_backend)).c_str(), quote(ggml_backend_name(sched->backends[0])).c_str(),
-                quote(ggml_backend_buffer_name(buffer)).c_str(), ggml_backend_buffer_is_host(buffer) ? "true" : "false",
-                row.source->flags & GGML_TENSOR_FLAG_INPUT ? "true" : "false", quote(row.route).c_str(),
-                (long long) row.copy_us, (long long) row.wait_us, (long long) row.setter.enqueue_us,
-                (long long) row.setter.wait_us, row.setter.calls);
+        ggml_backend_sched_print_join_input(sched, expert_graph, row);
     }
     if (fused_timing && timed_cold_split >= 0) {
-        fused_timing(sched->backends[0], 3, nullptr);
+        fused_timing(sched->backends[0], GGML_BACKEND_FUSED_TIMING_CANCEL, nullptr);
     }
     if (sched->profile) {
         const uint64_t graph = ++sched->profile_graphs;
@@ -2074,108 +2058,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     (long long) timing[b].source_wait_us, timing[b].source_wait_calls,
                     (long long) timing[b].destination_wait_us, timing[b].destination_wait_calls,
                     (long long) timing[b].copy_us, timing[b].copy_calls);
-            if (dispatch_profile[b]) {
-                ggml_backend_dispatch_profile p = {};
-                dispatch_profile[b](sched->backends[b], &p, false);
-                fprintf(stderr, "cuda_dispatch_profile: {\"sched\":\"%p\",\"graph\":%llu,\"tokens\":%lld,\"backend\":\"%s\",\"calls\":%d,\"direct\":%d,\"captures\":%d,\"reuse\":%d,\"launches\":%d,\"dispatch_us\":%lld,\"bookkeeping_us\":%lld,\"evaluate_us\":%lld,\"graph_api_us\":%lld,\"launch_us\":%lld,\"graphs_cached\":%zu}\n",
-                    (void *) sched, (unsigned long long) graph, (long long) n_tokens,
-                    ggml_backend_name(sched->backends[b]),
-                    p.calls, p.direct, p.captures, p.reuse, p.launches,
-                    (long long) p.dispatch_us, (long long) p.bookkeeping_us,
-                    (long long) p.evaluate_us, (long long) p.graph_api_us,
-                    (long long) p.launch_us, p.graphs_cached);
-            }
-        }
-        if (trace_dependencies) {
-            sched->profile_dependencies = false;
-            for (int s = 0; s < sched->n_splits; ++s) {
-                const auto & split = splits[s];
-                for (int n = 0; n < split.graph.n_nodes; ++n) {
-                    const ggml_tensor * stage = split.graph.nodes[n];
-                    if (stage->op != GGML_OP_CPY || strncmp(stage->name, "moe_stage_", 10) != 0) {
-                        continue;
-                    }
-                    int cold_split = -1, hot_count = 0;
-                    for (int c = s + 1; c < sched->n_splits; ++c) {
-                        for (int j = 0; j < splits[c].graph.n_nodes; ++j) {
-                            const ggml_tensor * cold = splits[c].graph.nodes[j];
-                            if (cold->op == GGML_OP_MOE_COLD && (cold->src[3] == stage || cold->src[4] == stage)) {
-                                cold_split = c;
-                            }
-                        }
-                    }
-                    if (cold_split > 0) {
-                        const auto & hot = splits[cold_split - 1].graph;
-                        for (int j = 0; j < hot.n_nodes; ++j) {
-                            const ggml_tensor * node = hot.nodes[j];
-                            hot_count += node->op == GGML_OP_MUL_MAT_ID && node->src[0] && strstr(node->src[0]->name, ".hot");
-                        }
-                    }
-                    fprintf(stderr, "sched_stage: {\"graph\":%llu,\"tokens\":%lld,\"split\":%d,\"name\":\"%s\",\"backend\":\"%s\",\"data\":\"%p\",\"bytes\":%zu,\"host\":%s,\"protected\":%s,\"cold_split\":%d,\"hot_count\":%d,\"cold_inputs\":%d}\n",
-                            (unsigned long long) graph, (long long) n_tokens, s, stage->name, ggml_backend_name(sched->backends[split.backend_id]), stage->data, ggml_nbytes(stage),
-                            ggml_backend_buffer_is_host(stage->buffer) ? "true" : "false",
-                            stage->view_src && (stage->flags & GGML_TENSOR_FLAG_OUTPUT) && (stage->view_src->flags & GGML_TENSOR_FLAG_OUTPUT) ? "true" : "false",
-                            cold_split, hot_count, cold_split >= 0 ? splits[cold_split].n_inputs : -1);
-                }
-            }
-            auto json_name = [](const char * name) {
-                std::string value = "\"";
-                for (const unsigned char * p = (const unsigned char *) name; *p; p++) {
-                    if (*p == '\"' || *p == '\\') {
-                        value += '\\';
-                        value += (char) *p;
-                    } else if (*p < 32) {
-                        char escaped[7];
-                        snprintf(escaped, sizeof(escaped), "\\u%04x", (unsigned int) *p);
-                        value += escaped;
-                    } else {
-                        value += (char) *p;
-                    }
-                }
-                return value + "\"";
-            };
-            for (const auto & d : dependencies) {
-                const auto & split = splits[d.split];
-                ggml_tensor * input = split.inputs[d.input];
-                const ggml_tensor * root = input;
-                while (root->view_src) {
-                    root = root->view_src;
-                }
-                const ggml_tensor * copy = tensor_copy(input, split.backend_id, sched->cur_copy);
-                int producer_split = -1, producer_node = -1;
-                for (int s = 0; s < d.split; s++) {
-                    for (int n = 0; n < splits[s].graph.n_nodes; n++) {
-                        if (splits[s].graph.nodes[n] == root) {
-                            producer_split = s;
-                            producer_node = n;
-                        }
-                    }
-                }
-                int hot_count = 0, hot_first = -1, hot_last = -1, cold_count = 0;
-                if (d.split > 0) {
-                    const auto & previous = splits[d.split - 1].graph;
-                    for (int n = 0; n < previous.n_nodes; n++) {
-                        const ggml_tensor * node = previous.nodes[n];
-                        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] && strstr(node->src[0]->name, ".hot")) {
-                            if (hot_first < 0) { hot_first = n; }
-                            hot_last = n;
-                            hot_count++;
-                        }
-                    }
-                }
-                for (int n = 0; n < split.graph.n_nodes; n++) {
-                    cold_count += split.graph.nodes[n]->op == GGML_OP_MOE_COLD;
-                }
-                const ggml_tensor * output = split.graph.nodes[split.graph.n_nodes - 1];
-                fprintf(stderr, "sched_dependency: {\"sched\":\"%p\",\"graph\":%llu,\"tokens\":%lld,\"split\":%d,\"input\":%d,\"source_backend\":%s,\"destination_backend\":%s,\"source_name\":%s,\"root_name\":%s,\"root_op\":%s,\"producer_split\":%d,\"producer_node\":%d,\"hot_count\":%d,\"hot_first\":%d,\"hot_last\":%d,\"cold_count\":%d,\"source_data\":\"%p\",\"source_bytes\":%zu,\"copy_data\":\"%p\",\"copy_bytes\":%zu,\"cpu_output_data\":\"%p\",\"cpu_output_bytes\":%zu,\"source_wait_us\":%lld,\"destination_wait_us\":%lld,\"copy_us\":%lld}\n",
-                        (void *) sched, (unsigned long long) graph, (long long) n_tokens, d.split, d.input,
-                        json_name(ggml_backend_name(ggml_backend_sched_get_tensor_backend(sched, split.inputs[d.input]))).c_str(),
-                        json_name(ggml_backend_name(sched->backends[split.backend_id])).c_str(),
-                        json_name(input->name).c_str(), json_name(root->name).c_str(), json_name(ggml_op_name(root->op)).c_str(),
-                        producer_split, producer_node, hot_count, hot_first, hot_last, cold_count,
-                        input->data, ggml_nbytes(input), copy->data, ggml_nbytes(copy), output->data, ggml_nbytes(output),
-                        (long long) d.source_wait_us, (long long) d.destination_wait_us, (long long) d.copy_us);
-            }
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -2198,8 +2080,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
     const char * GGML_SCHED_PROFILE = getenv("GGML_SCHED_PROFILE");
     sched->profile = GGML_SCHED_PROFILE && atoi(GGML_SCHED_PROFILE) != 0;
-    const char * GGML_SCHED_PROFILE_DEPS = getenv("GGML_SCHED_PROFILE_DEPS");
-    sched->profile_dependencies = sched->profile && GGML_SCHED_PROFILE_DEPS && atoi(GGML_SCHED_PROFILE_DEPS) != 0;
     const char * expert_timing = getenv("GGML_SCHED_EXPERT_TIMING");
     sched->expert_timing = expert_timing && atoi(expert_timing) != 0;
     const char * expert_input_timing = getenv("GGML_SCHED_EXPERT_INPUT_TIMING");

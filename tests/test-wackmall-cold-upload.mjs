@@ -8,8 +8,6 @@ function run(enabled, generated = true, direct = false, fallback = '', guard = '
     const env = {...fixtureEnv(), LLAMA_EXPERT_FUSE_STAGING: '1', LLAMA_EXPERT_ASYNC_COLD_UPLOAD: enabled ? '1' : '0',
         GGML_SCHED_EXPERT_TIMING: '1', GGML_SCHED_EXPERT_INPUT_TIMING: '1', GGML_SCHED_PROFILE: '0',
         WACKMALL_TEST_TIMING_GENERATED: generated ? '1' : '0', WACKMALL_TEST_JOIN_INPUT: '1'};
-    for (const key of ['GGML_CUDA_DISABLE_GRAPHS', 'GGML_CUDA_NO_PINNED', 'WACKMALL_TEST_CALLBACK',
-        'WACKMALL_TEST_COLD_UPLOAD_GUARD', 'WACKMALL_TEST_COLD_UPLOAD_ABORT']) delete env[key];
     if (direct) env.GGML_CUDA_DISABLE_GRAPHS = '1';
     if (fallback === 'pageable') env.GGML_CUDA_NO_PINNED = '1';
     if (fallback === 'callback') env.WACKMALL_TEST_CALLBACK = '1';

@@ -295,7 +295,7 @@ if (UNIX AND GGML_CUDA)
         execute_process(COMMAND ${WACKMALL_NODE_EXECUTABLE} -p "process.versions.node.split('.')[0]"
             OUTPUT_VARIABLE WACKMALL_NODE_MAJOR OUTPUT_STRIP_TRAILING_WHITESPACE)
         if (WACKMALL_NODE_MAJOR GREATER_EQUAL 22)
-            foreach(test_name IN ITEMS cold-upload dispatch-profile fused-staging hot-join join-input observation periodic sidecar)
+            foreach(test_name IN ITEMS cold-upload fused-staging hot-join join-input observation periodic sidecar)
                 llama_test_cmd(${WACKMALL_NODE_EXECUTABLE} NAME test-wackmall-${test_name} LABEL cuda
                     ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-wackmall-${test_name}.mjs
                          $<TARGET_FILE:test-wackmall-staging> ${CMAKE_CURRENT_SOURCE_DIR}/wackmall-staging-seed.csv)
@@ -318,7 +318,8 @@ if (UNIX AND GGML_CUDA)
         foreach(test_case IN ITEMS stock-1024 down-1024 hot-16 hot-18 stock-17 down-17 stock-63 down-63 stock-129)
             string(REPLACE "-" ";" test_args ${test_case})
             llama_test(test-wackmall-mmq-padding NAME test-wackmall-mmq-padding-${test_case} LABEL cuda ARGS ${test_args})
-            set_tests_properties(test-wackmall-mmq-padding-${test_case} PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+            set_tests_properties(test-wackmall-mmq-padding-${test_case} PROPERTIES
+                TIMEOUT 60 RUN_SERIAL TRUE ENVIRONMENT "CUDA_LAUNCH_BLOCKING=1")
         endforeach()
     endif()
 endif()

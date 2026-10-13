@@ -13,12 +13,12 @@ struct llama_model;
 //
 // enabled via env:
 //   LLAMA_EXPERT_HOT   - path to heat csv with header "layer,expert,count"
-//                        (seed; optional if LLAMA_EXPERT_ADAPT=1)
+//                        (seed; optional when adaptation is enabled)
 //   LLAMA_EXPERT_SIDECAR_IN/OUT - independent paths; unset: model.tier, empty: disabled
-//   LLAMA_EXPERT_S     - hot slots per layer (default 16)
+//   LLAMA_EXPERT_S     - hot slots per layer (unset: affordability-based selection)
 //   LLAMA_EXPERT_TMAX  - max n_tokens for the hot/cold path (default 16)
 //   LLAMA_EXPERT_STATS - dump cold-hit stats at exit ("1" = stderr, else path)
-//   LLAMA_EXPERT_ADAPT - 1: online repin of hot slots (decay + hysteresis)
+//   LLAMA_EXPERT_ADAPT - online repin of hot slots (default 1; decay + hysteresis)
 //   LLAMA_EXPERT_PERIODIC - opt-in 32-token / 64-opportunity / one-global-promotion policy
 //   LLAMA_EXPERT_OUTPUTS_BEFORE_SYNC - opt-in generated-decode output copies before the periodic tier wait
 //   LLAMA_EXPERT_USAGE - dump learned hot set at exit (heat csv format)
