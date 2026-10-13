@@ -134,14 +134,17 @@ struct llama_context {
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    // deferred tier updates must run after output submission and before advancing to another ubatch
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   generated_decode = false,
+                              bool   defer_tier_update = false);
 
     int encode(const llama_batch & batch_inp);
-    int decode(const llama_batch & batch_inp);
+    int decode(const llama_batch & batch_inp, bool generated_decode = false);
 
     //
     // state save/load
@@ -258,7 +261,8 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                                   bool   is_reserve = false) const;
 
     llm_graph_cb graph_get_cb() const;
 

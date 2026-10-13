@@ -151,6 +151,30 @@ extern "C" {
         void * context;
     };
 
+    // Optional host-dispatch profiling extension; no device completion waits.
+    struct ggml_backend_dispatch_profile {
+        int64_t dispatch_us, bookkeeping_us, evaluate_us, graph_api_us, launch_us;
+        int calls, direct, captures, reuse, launches;
+        size_t graphs_cached;
+    };
+    typedef void (*ggml_backend_dispatch_profile_t)(ggml_backend_t backend, struct ggml_backend_dispatch_profile * out, bool reset);
+
+    struct ggml_backend_stage_copy {
+        const struct ggml_tensor * src;
+        struct ggml_tensor * dst;
+    };
+    // False means unsupported and no work submitted. True guarantees current host inputs are ready.
+    typedef bool (*ggml_backend_fused_stage_t)(ggml_backend_t backend, struct ggml_cgraph * prefix,
+            struct ggml_cgraph * suffix, const struct ggml_backend_stage_copy * copies, int n_copies, int64_t * wait_us);
+
+    struct ggml_backend_fused_timing { double hot_us, hot_to_join_us; bool ready; void * pending; };
+    // 0: arm, 1: query hot, 2: mark join and detach, 3: cancel, 4: collect detached sample. No waits.
+    typedef void (*ggml_backend_fused_timing_t)(ggml_backend_t backend, int action, struct ggml_backend_fused_timing * out);
+
+    struct ggml_backend_set_timing { int64_t enqueue_us, wait_us; int calls; };
+    // Thread-local scope around an existing synchronous setter; false collects and disarms.
+    typedef void (*ggml_backend_set_timing_t)(bool arm, struct ggml_backend_set_timing * out);
+
     //
     // Backend device
     //

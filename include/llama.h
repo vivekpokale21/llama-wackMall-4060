@@ -337,6 +337,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool load_mtp;        // load optional MTP layers
     };
 
     struct llama_sampler_seq_config {
@@ -973,6 +974,13 @@ extern "C" {
     //   -1 - invalid input batch
     // < -1 - fatal error (processed ubatches will remain in the context's memory)
     LLAMA_API int32_t llama_decode(
+            struct llama_context * ctx,
+              struct llama_batch   batch);
+
+    // Experimental expert-tier provenance: caller certifies a sampled generated token, not a prompt/draft.
+    // Accepts only one text token on sequence 0 in a single-sequence context; otherwise returns -1.
+    // Stateless: ordinary llama_decode() calls remain unattributed.
+    LLAMA_API int32_t llama_decode_generated(
             struct llama_context * ctx,
               struct llama_batch   batch);
 

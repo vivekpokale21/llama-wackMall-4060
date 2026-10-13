@@ -348,6 +348,8 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // Caller-certified generated decode; used for attribution and asynchronous expert upload eligibility.
+    GGML_API void                 ggml_backend_sched_set_generated_decode(ggml_backend_sched_t sched, bool generated_decode);
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 

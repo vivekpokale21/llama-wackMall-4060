@@ -802,19 +802,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
-    if (params.cmoe) {
-        params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
-        params.fit_params = true;
-        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        if (params.n_parallel < 0) {
-            params.n_parallel = 1;
-        }
-        params.n_batch = 256;
-        params.n_ubatch = 256;
-        params.kv_unified = true;
-        params.no_kv_offload = false;
-    }
-
     // cmoe: keep n_threads == -1 as an auto marker when -t is unset; it is
     // resolved after model load when the dense size is known (common.cpp)
     const bool cmoe_auto_threads = params.cpuparams.n_threads < 0;

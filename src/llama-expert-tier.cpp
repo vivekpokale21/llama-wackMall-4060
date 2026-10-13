@@ -1,4 +1,5 @@
 #include "llama-expert-tier.h"
+#include "llama-expert-policy.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -257,6 +258,7 @@ struct layer_tier {
     std::vector<int32_t> slot_expert; // [n_slots], -1 = empty
     std::vector<int32_t> lut_host;    // [n_expert]
     std::vector<float>   score;       // [n_expert], cumulative (LLAMA_EXPERT_DECAY)
+    std::vector<uint64_t> pending;    // periodic generated-decode window only
     std::vector<uint64_t> cum;        // [n_expert], exact counts for persistence
     std::vector<int32_t> dwell;       // [n_slots]
     uint64_t cum_cold = 0, cum_total = 0, cum_graphs = 0;
@@ -292,6 +294,9 @@ static ggml_context * g_ctx_cpu = nullptr;
 static std::unordered_map<const ggml_tensor *, store> g_stores;
 static std::vector<layer_tier> g_layers;
 static uint64_t g_repins = 0; // hot-set changes since init
+static bool g_periodic = false;
+static bool g_outputs_before_sync = false;
+static periodic_policy g_policy;
 
 static size_t   g_pool_bytes = 0; // LLAMA_EXPERT_RAMPOOL budget in bytes (0 = off)
 static size_t   g_pool_alloc = 0; // resident pool bytes
@@ -301,6 +306,9 @@ static uint64_t g_pool_hits = 0, g_pool_cold = 0;
 
 static uint64_t g_fetch_us = 0;   // cumulative wall time in pool_fill() memcpy
 static uint64_t g_steps = 0;      // update() calls (= graph computes)
+static bool     g_measure_coordination = false;
+static uint64_t g_sync_wait_us = 0, g_update_us = 0;
+static FILE *   g_observation_log = nullptr;
 static FILE *   g_route_log = nullptr; // actual-routing trace (co-opened with pred log)
 
 // pre-gate predictor: immutable CPU mirrors of each MoE layer's router and
@@ -338,7 +346,9 @@ static std::unordered_map<const void *, probe_ctx> g_probe_ix; // ptrs->data -> 
 static std::atomic<uint64_t> g_probe_hits{0}, g_probe_miss{0};
 
 static bool g_dirty = false;
-static std::string g_sidecar_path;
+static std::string g_sidecar_in_path;
+static std::string g_sidecar_out_path;
+static int g_sidecar_n_expert = 0;
 static uint64_t g_fingerprint = 0;
 
 static const char * pregate_probe(const void * key, int64_t e, const char * fallback) {
@@ -390,15 +400,16 @@ static uint64_t compute_fingerprint(const llama_model & model) {
 }
 
 static void save_sidecar();
+static void flush_periodic_scores(bool boundary);
 
 static std::vector<std::vector<float>> load_sidecar(const llama_model & model) {
     std::vector<std::vector<float>> result;
-    if (g_sidecar_path.empty()) {
+    if (g_sidecar_in_path.empty()) {
         return result;
     }
-    std::ifstream in(g_sidecar_path, std::ios::binary);
+    std::ifstream in(g_sidecar_in_path, std::ios::binary);
     if (!in) {
-        TIER_LOG("%s: no sidecar at %s\n", __func__, g_sidecar_path.c_str());
+        TIER_LOG("%s: no sidecar at %s\n", __func__, g_sidecar_in_path.c_str());
         return result;
     }
     uint32_t version = 0;
@@ -426,15 +437,18 @@ static std::vector<std::vector<float>> load_sidecar(const llama_model & model) {
             return result;
         }
     }
-    TIER_LOG("%s: loaded sidecar %s (fingerprint %016llx)\n", __func__, g_sidecar_path.c_str(), (unsigned long long) fp);
+    TIER_LOG("%s: loaded sidecar %s (fingerprint %016llx)\n", __func__, g_sidecar_in_path.c_str(), (unsigned long long) fp);
     return result;
 }
 
 static void save_sidecar() {
-    if (!g_dirty || g_sidecar_path.empty() || g_fingerprint == 0) {
+    if (g_periodic) {
+        flush_periodic_scores(false);
+    }
+    if (!g_dirty || g_sidecar_out_path.empty() || g_fingerprint == 0) {
         return;
     }
-    const std::string tmp = g_sidecar_path + ".tmp";
+    const std::string tmp = g_sidecar_out_path + ".tmp";
     std::ofstream out(tmp, std::ios::binary);
     if (!out) {
         TIER_LOG("%s: cannot create %s\n", __func__, tmp.c_str());
@@ -443,11 +457,12 @@ static void save_sidecar() {
     const uint32_t version = 1;
     out.write((const char *) &version, sizeof(version));
     out.write((const char *) &g_fingerprint, sizeof(g_fingerprint));
+    // Preserve physical layer indexing, including layers without CPU-tier stores.
+    const std::vector<float> zero_scores(g_sidecar_n_expert, 0.0f);
     for (const auto & L : g_layers) {
-        if (L.score.empty()) {
-            continue;
-        }
-        out.write((const char *) L.score.data(), L.score.size() * sizeof(float));
+        const auto & scores = L.score.empty() ? zero_scores : L.score;
+        GGML_ASSERT(scores.size() == (size_t) g_sidecar_n_expert);
+        out.write((const char *) scores.data(), scores.size() * sizeof(float));
     }
     out.close();
     if (!out) {
@@ -456,15 +471,15 @@ static void save_sidecar() {
         return;
     }
 #if defined(_WIN32)
-    const bool ok = MoveFileExA(tmp.c_str(), g_sidecar_path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+    const bool ok = MoveFileExA(tmp.c_str(), g_sidecar_out_path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
 #else
-    const bool ok = std::rename(tmp.c_str(), g_sidecar_path.c_str()) == 0;
+    const bool ok = std::rename(tmp.c_str(), g_sidecar_out_path.c_str()) == 0;
 #endif
     if (!ok) {
-        TIER_LOG("%s: rename failed for %s\n", __func__, g_sidecar_path.c_str());
+        TIER_LOG("%s: rename failed for %s\n", __func__, g_sidecar_out_path.c_str());
         std::remove(tmp.c_str());
     } else {
-        TIER_LOG("%s: saved sidecar %s (fingerprint %016llx)\n", __func__, g_sidecar_path.c_str(), (unsigned long long) g_fingerprint);
+        TIER_LOG("%s: saved sidecar %s (fingerprint %016llx)\n", __func__, g_sidecar_out_path.c_str(), (unsigned long long) g_fingerprint);
     }
 }
 
@@ -918,7 +933,7 @@ static bool parse_heat_csv(const std::string & path, int n_layer,
 // consume selection counts, update decayed scores + cumulative stats, and
 // (LLAMA_EXPERT_ADAPT) repin at most one slot. called at graph build time,
 // i.e. between compute steps; counts are written by the fused cold op.
-static void maybe_update(layer_tier & L) {
+static void maybe_update(layer_tier & L, bool learn = true) {
     if (!L.sd || !L.sd->counts->data) {
         return;
     }
@@ -935,12 +950,18 @@ static void maybe_update(layer_tier & L) {
     }();
 
     for (int e = 0; e < n; e++) {
-        if (cnt[e] > 0) {
+        if (learn && cnt[e] > 0 && !g_periodic) {
             g_dirty = true;
         }
-        L.score[e] = L.score[e]*decay + (float) cnt[e];
-        L.cum[e]  += (uint64_t) cnt[e];
-        if (mask[e]) {
+        if (learn) {
+            if (g_periodic) {
+                L.pending[e] += (uint64_t) cnt[e];
+            } else {
+                L.score[e] = L.score[e]*decay + (float) cnt[e];
+            }
+            L.cum[e] += (uint64_t) cnt[e];
+        }
+        if (learn && mask[e]) {
             L.cum_cold += (uint64_t) cnt[e];
             if (L.pool) {
                 g_pool_cold += (uint64_t) cnt[e];
@@ -951,8 +972,10 @@ static void maybe_update(layer_tier & L) {
         }
         cnt[e] = 0;
     }
-    L.cum_total += (uint64_t) cnt[n];
-    L.cum_graphs++;
+    if (learn) {
+        L.cum_total += (uint64_t) cnt[n];
+        L.cum_graphs++;
+    }
     cnt[n] = 0;
 
     // publish completed prefetch fills (READY -> RESIDENT); recycle any whose
@@ -1008,7 +1031,7 @@ static void maybe_update(layer_tier & L) {
         }
     }
 
-    if (!g_adapt) {
+    if (!g_adapt || g_periodic) {
         return;
     }
 
@@ -1132,6 +1155,13 @@ static void dump_stats() {
         FILE * f = strcmp(p, "1") ? fopen(p, "w") : stderr;
         if (f) {
             fprintf(f, "expert_tier: repins %llu\n", (unsigned long long) g_repins);
+            if (g_periodic) {
+                fprintf(f, "expert_periodic: decode_tokens %llu boundaries %llu period 32 dwell 64 global_budget 1\n",
+                        (unsigned long long) g_policy.tokens, (unsigned long long) g_policy.opportunities);
+            }
+            fprintf(f, "expert_coordination: sync_count %llu sync_wait_us %llu update_count %llu update_us %llu\n",
+                    (unsigned long long) g_steps, (unsigned long long) g_sync_wait_us,
+                    (unsigned long long) g_steps, (unsigned long long) g_update_us);
             if (g_pool_bytes) {
                 fprintf(f, "expert_pool: fills %llu evictions %llu hits %llu / %llu cold (%.1f%%) resident %.2f GiB\n",
                         (unsigned long long) g_pool_fills, (unsigned long long) g_pool_evictions,
@@ -1156,6 +1186,17 @@ static void dump_stats() {
                         (unsigned long long) g_stage_fails.load());
             }
             {
+                // Fixed-cache runs do not enable the optional predict/pread hooks.
+                // Resolve only the timer from the existing CPU device registry;
+                // no backend allocation or per-token execution change is needed.
+                if (!g_fn_timer) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                    if (reg) {
+                        g_fn_timer = (moe_timer_fn) ggml_backend_reg_get_proc_address(reg, "ggml_moe_cold_timer_us");
+                    }
+                }
+                fprintf(f, "expert_timer_status: cold_compute_available %d\n", g_fn_timer ? 1 : 0);
                 const uint64_t cold_us = MOE_TIMER_HOOK();
                 fprintf(f, "expert_timers: steps %llu fetch %llu us (%.2f ms/step) cold_compute %llu us (%.2f ms/step)\n",
                         (unsigned long long) g_steps,
@@ -1250,13 +1291,161 @@ static void dump_stats() {
     }
 }
 
-void update() {
+static void close_observation_log() {
+    if (g_observation_log) {
+        fclose(g_observation_log);
+        g_observation_log = nullptr;
+    }
+}
+
+static void observe_counts(const layer_tier & L, int64_t n_tokens, bool generated_decode) {
+    if (!L.sd || !L.sd->counts->data) {
+        return;
+    }
+    const int32_t * cnt = (const int32_t *) L.sd->counts->data;
+    const int32_t * mask = (const int32_t *) L.sd->mask->data;
+    if (cnt[L.n_expert] <= 0) {
+        return;
+    }
+    int64_t hot = 0, cold = 0;
+    for (int e = 0; e < L.n_expert; e++) {
+        (mask[e] ? cold : hot) += cnt[e];
+    }
+    fprintf(g_observation_log,
+            "{\"step\":%llu,\"tokens\":%lld,\"generated_decode\":%s,\"layer\":%d,\"total\":%d,\"hot\":%lld,\"cold\":%lld,\"counts\":[",
+            (unsigned long long) g_steps, (long long) n_tokens, generated_decode ? "true" : "false", L.il,
+            cnt[L.n_expert], (long long) hot, (long long) cold);
+    bool first = true;
+    for (int e = 0; e < L.n_expert; e++) {
+        if (cnt[e] > 0) {
+            fprintf(g_observation_log, "%s[%d,%d,%d]", first ? "" : ",", e, cnt[e], mask[e] ? 0 : 1);
+            first = false;
+        }
+    }
+    fputs("]}\n", g_observation_log);
+}
+
+static void flush_periodic_scores(bool boundary) {
+    static const float decay = [] {
+        const char * e = getenv("LLAMA_EXPERT_DECAY");
+        return e ? (float) atof(e) : 0.999f;
+    }();
+    for (auto & L : g_layers) {
+        if (!L.sd) {
+            continue;
+        }
+        for (int e = 0; e < L.n_expert; ++e) {
+            if (L.pending[e]) {
+                g_dirty = true;
+            }
+            L.score[e] = L.score[e] * (boundary ? decay : 1.0f) + (float) L.pending[e];
+            L.pending[e] = 0;
+        }
+        if (boundary) {
+            for (int s = 0; s < L.n_slots; ++s) {
+                if (s != L.sentinel && L.dwell[s] < INT32_MAX) {
+                    ++L.dwell[s];
+                }
+            }
+        }
+    }
+}
+
+static void periodic_promote() {
+    if (!g_adapt) {
+        return;
+    }
+    promotion best;
+    for (const auto & L : g_layers) {
+        if (!L.sd) {
+            continue;
+        }
+        const int32_t * mask = (const int32_t *) L.sd->mask->data;
+        for (int s = 0; s < L.n_slots; ++s) {
+            if (s == L.sentinel) {
+                continue;
+            }
+            const float old_score = L.slot_expert[s] < 0 ? 0.0f : L.score[L.slot_expert[s]];
+            for (int e = 0; e < L.n_expert; ++e) {
+                if (mask[e]) {
+                    g_policy.consider(best, {L.il, s, e, old_score, L.score[e], (uint64_t) L.dwell[s]});
+                }
+            }
+        }
+    }
+    if (best.layer < 0) {
+        return;
+    }
+    auto & L = g_layers[best.layer];
+    const int old = L.slot_expert[best.slot];
+    size_t bytes = 0;
+    const int64_t start = ggml_time_us();
+    // All previous graph users completed. Finish every weight copy before publishing any LUT.
+    for (auto & kv : L.ws) {
+        store & st = *kv.second;
+        const size_t slice = ggml_nbytes(kv.first) / L.n_expert;
+        const char * src = (const char *) kv.first->data + slice * best.expert;
+        ggml_backend_tensor_set(st.w_hot, src, slice * best.slot, slice);
+        bytes += slice;
+    }
+    const int64_t copy_us = ggml_time_us() - start;
+    L.lut_host[best.expert] = best.slot;
+    if (old >= 0) {
+        L.lut_host[old] = L.sentinel;
+    }
+    for (auto & kv : L.ws) {
+        store & st = *kv.second;
+        ggml_backend_tensor_set(st.lut, L.lut_host.data(), 0, L.n_expert * sizeof(int32_t));
+        int32_t * mask = (int32_t *) st.mask->data;
+        mask[best.expert] = 0;
+        if (old >= 0) {
+            mask[old] = 1;
+        }
+    }
+    L.slot_expert[best.slot] = best.expert;
+    L.dwell[best.slot] = 0;
+    ++g_repins;
+    if (g_measure_coordination) {
+        TIER_LOG("expert_promotion: {\"decode_tokens\":%llu,\"boundary\":%llu,\"layer\":%d,\"slot\":%d,\"old\":%d,\"expert\":%d,\"old_score\":%.6f,\"new_score\":%.6f,\"dwell\":%llu,\"bytes\":%zu,\"copy_us\":%lld}\n",
+                (unsigned long long) g_policy.tokens, (unsigned long long) g_policy.opportunities,
+                best.layer, best.slot, old, best.expert, best.old_score, best.new_score,
+                (unsigned long long) best.dwell, bytes, (long long) copy_us);
+    }
+}
+
+void synchronize_and_update(ggml_backend_sched_t sched, int64_t n_tokens, bool generated_decode) {
+    const int64_t t_sync_start_us = g_measure_coordination ? ggml_time_us() : 0;
+    // Counts and hot buffers may still be in use by the asynchronous graph.
+    ggml_backend_sched_synchronize(sched);
+    const int64_t t_update_start_us = g_measure_coordination ? ggml_time_us() : 0;
     g_pred_step.fetch_add(1, std::memory_order_relaxed);
     g_steps++;
     for (auto & L : g_layers) {
+        if (g_observation_log) {
+            observe_counts(L, n_tokens, generated_decode);
+        }
         g_pool_fill_budget = 16 << 20;
-        maybe_update(L);
+        maybe_update(L, !g_periodic || (generated_decode && n_tokens == 1));
     }
+    if (g_periodic && g_policy.advance(generated_decode, n_tokens)) {
+        flush_periodic_scores(true);
+        periodic_promote();
+    }
+    if (g_observation_log) {
+        fflush(g_observation_log);
+    }
+    if (g_measure_coordination) {
+        g_sync_wait_us += (uint64_t) (t_update_start_us - t_sync_start_us);
+        g_update_us += (uint64_t) (ggml_time_us() - t_update_start_us);
+    }
+}
+
+bool active_for_tokens(int64_t n_tokens) {
+    return !g_stores.empty() && is_decode_batch_size(n_tokens, g_tmax);
+}
+
+bool outputs_before_sync(int64_t n_tokens, bool generated_decode) {
+    return g_outputs_before_sync && g_periodic && generated_decode && n_tokens == 1 && active_for_tokens(n_tokens);
 }
 
 size_t expert_weight_bytes(const llama_model & model) {
@@ -1278,6 +1467,11 @@ void init(const llama_model & model) {
     }
     const char * env_s   = getenv("LLAMA_EXPERT_S");
     const char * env_hot = getenv("LLAMA_EXPERT_HOT");
+    const char * periodic = getenv("LLAMA_EXPERT_PERIODIC");
+    g_periodic = periodic && atoi(periodic) != 0;
+    const char * outputs_before_sync = getenv("LLAMA_EXPERT_OUTPUTS_BEFORE_SYNC");
+    g_outputs_before_sync = outputs_before_sync && atoi(outputs_before_sync) != 0;
+    g_measure_coordination = getenv("LLAMA_EXPERT_STATS") != nullptr;
     if (const char * e = getenv("LLAMA_EXPERT_ADAPT")) {
         g_adapt = atoi(e) != 0;
     } else {
@@ -1324,6 +1518,10 @@ void init(const llama_model & model) {
         const char * e = getenv("LLAMA_EXPERT_PREAD");
         return !e || atoi(e) != 0;
     }();
+    if (g_periodic && (g_pool_bytes || g_poolB_bytes || g_predict || want_pread || g_madvise)) {
+        TIER_LOG("%s: periodic tier disabled: pool, prefetch, prediction, pread and madvise must be off\n", __func__);
+        return;
+    }
 
     bool manual_S = false;
     if (env_s) {
@@ -1348,12 +1546,15 @@ void init(const llama_model & model) {
         return;
     }
 
-    // sidecar persistence: compute fingerprint, set path, load if no HOT override
+    // Unset paths retain model-adjacent persistence; empty paths disable that direction.
     g_fingerprint = compute_fingerprint(model);
+    g_sidecar_n_expert = n_expert;
     const std::string mpath = model.path();
-    if (!mpath.empty()) {
-        g_sidecar_path = mpath + ".tier";
-    }
+    const std::string default_sidecar = mpath.empty() ? "" : mpath + ".tier";
+    const char * sidecar_in = getenv("LLAMA_EXPERT_SIDECAR_IN");
+    const char * sidecar_out = getenv("LLAMA_EXPERT_SIDECAR_OUT");
+    g_sidecar_in_path = sidecar_in ? sidecar_in : default_sidecar;
+    g_sidecar_out_path = sidecar_out ? sidecar_out : default_sidecar;
     if (!env_hot || !env_hot[0]) {
         const auto sidecar_heat = load_sidecar(model);
         if (!sidecar_heat.empty()) {
@@ -1445,7 +1646,7 @@ void init(const llama_model & model) {
     if (!manual_S && bytes_per_slot_all_layers > 0) {
         if (usable_vram >= bytes_per_slot_all_layers) {
             int autofit_s = (int) (usable_vram / bytes_per_slot_all_layers);
-            g_S = std::clamp(autofit_s, 1, n_expert);
+            g_S = resolve_slot_count(g_S, false, autofit_s, n_expert);
             TIER_LOG("%s: AUTO-FIT ENGINE -> set S = %d (Free VRAM: %.2f / %.2f GB, per-slot size: %.2f MB, total experts: %d)\n",
                            __func__, g_S, (double)free_vram / (1024.0*1024.0*1024.0),
                            (double)total_vram / (1024.0*1024.0*1024.0),
@@ -1457,12 +1658,14 @@ void init(const llama_model & model) {
         }
     }
 
-    // clamp a forced S to what fits; the unclamped path OOMs at graph capture
+    // An explicit S is caller policy. Keep the affordability calculation as a
+    // warning, but do not silently change a manually selected experiment.
     if (manual_S && bytes_per_slot_all_layers > 0) {
         const int afford = (int) (usable_vram / bytes_per_slot_all_layers);
+        g_S = resolve_slot_count(g_S, true, afford, n_expert);
         if (g_S > afford) {
-            TIER_LOG("%s: manual S = %d exceeds free VRAM, clamping to %d\n", __func__, g_S, afford);
-            g_S = std::max(afford, 0);
+            TIER_LOG("%s: manual S = %d exceeds conservative affordability estimate %d; honoring explicit S\n",
+                    __func__, g_S, afford);
         }
     }
 
@@ -1643,6 +1846,9 @@ void init(const llama_model & model) {
         L.dwell.assign(L.n_slots, 0);
         L.lut_host = lut_host;
         L.score.assign(n_expert, 0.0f);
+        if (g_periodic) {
+            L.pending.assign(n_expert, 0);
+        }
         L.cum.assign(n_expert, 0);
         if (il < (int) heat.size()) {
             for (const auto & p : heat[il]) {
@@ -1884,12 +2090,22 @@ void init(const llama_model & model) {
             __func__, g_S, g_stores.size(), (double) total_bytes/(1 << 30),
             total > 0 ? 100.0*hits/total : 0.0);
 
+    if (const char * path = getenv("LLAMA_EXPERT_OBSERVE")) {
+        if (path[0]) {
+            g_observation_log = fopen(path, "w");
+            if (g_observation_log) {
+                atexit(close_observation_log);
+            } else {
+                TIER_LOG("%s: cannot open observation log '%s'\n", __func__, path);
+            }
+        }
+    }
     pred_init(model);
 }
 
 ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, ggml_tensor * ids) {
     auto it = g_stores.find(w);
-    if (it == g_stores.end() || ids->ne[1] > (int64_t) g_tmax) {
+    if (it == g_stores.end() || !is_decode_batch_size(ids->ne[1], g_tmax)) {
         return ggml_mul_mat_id(ctx, w, x, ids);
     }
 
@@ -1921,7 +2137,7 @@ bool begin_moe_cold(bool eligible,
     auto iu = g_stores.find(up_w);
     auto id = g_stores.find(down_w);
     if (ig == g_stores.end() || iu == g_stores.end() || id == g_stores.end() ||
-        ids->ne[1] > (int64_t) g_tmax) {
+        !is_decode_batch_size(ids->ne[1], g_tmax)) {
         return false;
     }
     g_hot_only = true;
@@ -1937,18 +2153,6 @@ ggml_tensor * end_moe_cold(ggml_context * ctx,
     store & sd = g_stores[down_w];
     return ggml_moe_cold(ctx, gate_w, up_w, down_w, x, ids, sd.mask, sd.counts,
             g_stores[gate_w].ptrs, g_stores[up_w].ptrs, sd.ptrs);
-}
-
-ggml_tensor * build_moe_count(ggml_context * ctx, ggml_tensor * down_w, ggml_tensor * ids) {
-    // prompt-sized batches skip the fused path; harvest router decisions anyway
-    if (g_hot_only || g_stores.empty()) {
-        return nullptr;
-    }
-    auto it = g_stores.find(down_w);
-    if (it == g_stores.end() || ids->ne[1] <= (int64_t) g_tmax) {
-        return nullptr;
-    }
-    return ggml_moe_count(ctx, ids, it->second.counts);
 }
 
 }

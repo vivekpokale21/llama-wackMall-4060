@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-expert-policy.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -75,6 +76,7 @@ struct server_batch {
         llama_token token;
         llama_pos pos;
         bool output;
+        bool sampled_generated = false;
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -101,12 +103,12 @@ struct server_batch {
         tokens.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output) {
+    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool sampled_generated = false) {
         GGML_ASSERT(batch.token != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, pos, output });
+        tokens.push_back({ id_slot, token, pos, output, sampled_generated });
         return true;
     }
 
@@ -445,7 +447,7 @@ struct server_slot {
             // no speculative decoding
             i_batch = batch.size();
 
-            add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true);
+            add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, true);
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
@@ -3589,7 +3591,10 @@ private:
             n_empty_consecutive = 0;
         }
 
-        const int ret = llama_decode(ctx_tgt, batch_view);
+        // Origin is captured when enqueuing, before prompt completion changes slot state.
+        const bool generated_decode = llama_expert_tier::server_generated_decode(
+                batch_view.n_tokens, (int) slots.size(), spec != nullptr, batch.tokens[off].sampled_generated);
+        const int ret = generated_decode ? llama_decode_generated(ctx_tgt, batch_view) : llama_decode(ctx_tgt, batch_view);
 
         metrics.on_decoded(slots);
 

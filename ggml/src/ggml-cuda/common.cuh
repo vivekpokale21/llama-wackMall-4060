@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-backend-impl.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1220,6 +1221,15 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+struct ggml_cuda_hot_timing {
+    cudaEvent_t start = nullptr, end = nullptr, join = nullptr;
+    ~ggml_cuda_hot_timing() {
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(end));
+        CUDA_CHECK(cudaEventDestroy(join));
+    }
+};
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1229,9 +1239,15 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        if (stage_ready != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(stage_ready));
+        }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    cudaEvent_t stage_ready = nullptr;
+    std::shared_ptr<ggml_cuda_hot_timing> hot_timing;
+    bool timed_suffix = false;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
@@ -1408,6 +1424,15 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    bool profile_dispatch = false;
+    ggml_backend_dispatch_profile dispatch_profile = {};
+    int stage_start = -1;
+    cudaEvent_t stage_ready = nullptr;
+    cudaEvent_t stage_hot_start = nullptr, stage_hot_end = nullptr;
+    bool time_next_fused = false;
+#ifdef USE_CUDA_GRAPH
+    std::shared_ptr<ggml_cuda_hot_timing> timed_fused;
+#endif
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
@@ -1658,4 +1683,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

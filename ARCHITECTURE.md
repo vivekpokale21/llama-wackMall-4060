@@ -1,5 +1,7 @@
 # Architecture: llama-wackMall expert-granular MoE tiering engine
 
+This is the inherited wackMall design and historical disclosure, not the complete behavior of this fork. See [Hot Experts architecture](docs/HOT_EXPERTS.md) for mixed placement, prompt isolation, compact masks, generated-decode attribution and the opt-in bounded policy. In particular, forced runtime settings and prompt counting described below no longer apply to the validated hybrid path. The historical results do not establish performance or numerical equivalence for this fork.
+
 First public disclosure: 2026-07-26. Updated 2026-07-29 for v3 (RAM pool,
 pre-gated prefetch, per-layer budget fix, learned router heads roadmap).
 This document is published to disclose the methods and systems described

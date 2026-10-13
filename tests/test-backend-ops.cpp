@@ -6914,6 +6914,49 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_compact_causal_mask : public test_flash_attn_ext {
+    test_compact_causal_mask(int64_t head, int64_t queries, ggml_type type, int64_t keys = 512)
+        : test_flash_attn_ext(head, head, 4, {4, 1}, keys, queries, true, false, 0, 0, GGML_PREC_F32, type, type) {}
+
+    std::string op_desc(ggml_tensor *) override { return "COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE"; }
+    bool run_whole_graph() override { return true; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n % 2 == 0);
+        return std::max({nmse(a, b, n), nmse(a, a + n/2, n/2), nmse(b, b + n/2, n/2)});
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * dense = test_flash_attn_ext::build_graph(ctx);
+        ggml_tensor * prefix = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nb);
+        ggml_set_name(prefix, "prefix");
+        ggml_tensor * compact = ggml_flash_attn_ext(ctx, dense->src[0], dense->src[1], dense->src[2], prefix, 1.0f/sqrtf(hsk), 0, 0);
+        ggml_flash_attn_ext_set_prec(compact, prec);
+        return ggml_concat(ctx, dense, compact, 3);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            const int64_t first = kv - nb;
+            if (strcmp(t->name, "prefix") == 0) {
+                std::vector<int64_t> data(nb);
+                for (int64_t i = 0; i < nb; ++i) { data[i] = first + i; }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else if (strcmp(t->name, "m") == 0) {
+                std::vector<ggml_fp16_t> data(kv*nb);
+                for (int64_t i = 0; i < nb; ++i) {
+                    for (int64_t j = 0; j < kv; ++j) {
+                        data[i*kv + j] = ggml_fp32_to_fp16(j <= first + i ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9448,6 +9491,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_diag());
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 79, 1, 19, 13 }));
     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 256, 1, 8, 16 }));
+    for (auto type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t queries : {1, 2, 3, 65, 256}) {
+            test_cases.emplace_back(new test_compact_causal_mask(256, queries, type));
+        }
+        test_cases.emplace_back(new test_compact_causal_mask(256, 1, type, 16384));
+        test_cases.emplace_back(new test_compact_causal_mask(256, 2048, type, 4096));
+    }
 
     test_cases.emplace_back(new test_solve_tri());
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 11, 11, 1, 1 }, { 5, 11, 1, 1 }));
@@ -10505,7 +10555,16 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
-        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
+        using prefix_supported_t = bool (*)(ggml_backend_dev_t);
+        auto prefix_supported = (prefix_supported_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_flash_attn_causal_prefix_supported");
+        const bool compact_selected = op_names_filter && std::string(op_names_filter) == "COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE";
+        bool ok;
+        if (compact_selected && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && (!prefix_supported || !prefix_supported(dev))) {
+            fprintf(stderr, "CUDA backend does not advertise compact causal mask support\n");
+            ok = false;
+        } else {
+            ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
+        }
 
         if (ok) {
             n_ok++;

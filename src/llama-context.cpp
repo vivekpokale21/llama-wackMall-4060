@@ -1315,7 +1315,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool generated_decode, bool defer_tier_update) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1375,16 +1375,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    ggml_backend_sched_set_generated_decode(sched.get(), generated_decode && ubatch.n_tokens == 1 &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !cparams.pipeline_parallel);
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    ggml_backend_sched_set_generated_decode(sched.get(), false);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
     }
 
-    // compute is async: update() may overwrite tiering buffers the graph is still reading
-    ggml_backend_sched_synchronize(sched.get());
-    llama_expert_tier::update();
+    if (!defer_tier_update && llama_expert_tier::active_for_tokens(ubatch.n_tokens)) {
+        llama_expert_tier::synchronize_and_update(sched.get(), ubatch.n_tokens, generated_decode);
+    }
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -1695,7 +1698,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch & batch_inp) {
+int llama_context::decode(const llama_batch & batch_inp, bool generated_decode) {
+    if (generated_decode && !llama_expert_tier::generated_batch_shape(batch_inp, n_seq_max())) {
+        return -1;
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1858,7 +1864,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const bool defer_tier_update = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            !cparams.pipeline_parallel && n_outputs > 0 &&
+            llama_expert_tier::outputs_before_sync(ubatch.n_tokens, generated_decode);
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, generated_decode, defer_tier_update);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2011,6 +2020,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
             copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+        }
+
+        if (defer_tier_update) {
+            // Complete every output transfer and all old readers before counter consumption or tier mutation.
+            llama_expert_tier::synchronize_and_update(sched.get(), ubatch.n_tokens, generated_decode);
         }
 
         n_outputs_prev += n_outputs;
@@ -2392,7 +2406,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), true);
 
     res->reset();
 
@@ -2420,13 +2434,15 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                   bool   is_reserve) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
+        /*.is_reserve  =*/ is_reserve,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
@@ -4090,6 +4106,17 @@ int32_t llama_decode(
 //
 // perf
 //
+
+int32_t llama_decode_generated(llama_context * ctx, llama_batch batch) {
+    if (!ctx) {
+        return -1;
+    }
+    const int ret = ctx->decode(batch, true);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+    return ret;
+}
 
 llama_perf_context_data llama_perf_context(const llama_context * ctx) {
     llama_perf_context_data data = {};
